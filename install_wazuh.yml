@@ -1,0 +1,153 @@
+---
+- name: Installation du Wazuh Manager (all-in-one)
+  hosts: Wazuh
+  become: true
+
+  tasks:
+
+    - name: Nettoyer le cache apt et étendre le disque
+      ansible.builtin.shell: |
+        apt-get clean
+        rm -rf /var/cache/apt/archives/*.deb
+        growpart /dev/nvme0n1 1 || true
+        resize2fs /dev/nvme0n1p1 || true
+      ignore_errors: true
+
+    - name: Mettre à jour le cache apt
+      ansible.builtin.apt:
+        update_cache: true
+
+    - name: Installer les prérequis
+      ansible.builtin.apt:
+        name:
+          - curl
+          - apt-transport-https
+          - gnupg2
+        state: present
+
+    - name: Vérifier si Wazuh Manager est fonctionnel
+      ansible.builtin.shell: systemctl is-active wazuh-manager 2>/dev/null || echo "inactive"
+      register: wazuh_status
+      changed_when: false
+
+    - name: Nettoyer résidus wazuh si non fonctionnel
+      ansible.builtin.shell: |
+        systemctl stop wazuh-manager 2>/dev/null || true
+        pkill -f wazuh 2>/dev/null || true
+        fuser -k 1515/tcp 2>/dev/null || true
+        fuser -k 55000/tcp 2>/dev/null || true
+        sleep 3
+        dpkg --purge --force-all wazuh-manager wazuh-dashboard wazuh-indexer filebeat 2>/dev/null || true
+        rm -f /var/lib/dpkg/info/wazuh-manager.*
+        rm -f /var/lib/dpkg/info/wazuh-dashboard.*
+        dpkg --configure -a 2>/dev/null || true
+        rm -rf /var/ossec /etc/wazuh-* /var/lib/wazuh-indexer /var/log/wazuh-indexer
+      ignore_errors: true
+      when: wazuh_status.stdout != "active"
+
+    - name: Télécharger le script d'installation officiel
+      ansible.builtin.get_url:
+        url: https://packages.wazuh.com/4.9/wazuh-install.sh
+        dest: /root/wazuh-install.sh
+        mode: '0750'
+      when: wazuh_status.stdout != "active"
+
+    - name: Lancer l'installation all-in-one
+      ansible.builtin.command:
+        cmd: bash /root/wazuh-install.sh -a
+        chdir: /root
+      async: 1200
+      poll: 0
+      register: wazuh_install_job
+      when: wazuh_status.stdout != "active"
+
+    - name: Attendre la fin de l'installation
+      ansible.builtin.async_status:
+        jid: "{{ wazuh_install_job.ansible_job_id }}"
+      register: install_result
+      until: install_result.finished
+      retries: 120
+      delay: 10
+      when: wazuh_install_job.ansible_job_id is defined
+      ignore_errors: true
+
+    # ==========================================================
+    # T19 - Règles de détection de référence
+    # ==========================================================
+
+    - name: Ajouter les règles de référence Windows
+      ansible.builtin.copy:
+        dest: /var/ossec/etc/rules/windows_reference_rules.xml
+        owner: root
+        group: wazuh
+        mode: '0640'
+        content: |
+          <group name="windows_reference,">
+
+            <!-- Règle 1 : PowerShell Script Block Logging -->
+            <rule id="100100" level="7">
+              <field name="win.system.eventID">4104</field>
+              <description>Reference Rule - PowerShell Script Block Logging</description>
+              <mitre>
+                <id>T1059.001</id>
+              </mitre>
+              <group>sigma_reference,powershell,windows,</group>
+            </rule>
+
+            <!-- Règle 2 : Création de compte Windows -->
+            <rule id="100101" level="8">
+              <field name="win.system.eventID">4720</field>
+              <description>Reference Rule - Windows Account Creation</description>
+              <mitre>
+                <id>T1098</id>
+              </mitre>
+              <group>sigma_reference,account_manipulation,windows,</group>
+            </rule>
+
+            <!-- Règle 3 : Modification de compte Windows -->
+            <rule id="100102" level="8">
+              <field name="win.system.eventID">4738</field>
+              <description>Reference Rule - Windows Account Modification</description>
+              <mitre>
+                <id>T1098</id>
+              </mitre>
+              <group>sigma_reference,account_manipulation,windows,</group>
+            </rule>
+
+          </group>
+
+    - name: Vérifier la configuration des règles Wazuh
+      ansible.builtin.command:
+        cmd: /var/ossec/bin/wazuh-analysisd -t
+      register: wazuh_rules_test
+      changed_when: false
+
+    - name: Afficher le résultat du test
+      ansible.builtin.debug:
+        var: wazuh_rules_test.stdout_lines
+
+    - name: Redémarrer Wazuh Manager
+      ansible.builtin.systemd:
+        name: wazuh-manager
+        state: restarted
+
+    # ==========================================================
+    # Affichage du log d'installation en cas d'échec
+    # ==========================================================
+
+    - name: Afficher le log en cas d'échec
+      ansible.builtin.command:
+        cmd: tail -50 /var/log/wazuh-install.log
+      register: wazuh_log
+      when:
+        - install_result is defined
+        - install_result.failed is defined
+        - install_result.failed
+      ignore_errors: true
+
+    - name: Afficher le contenu du log
+      ansible.builtin.debug:
+        var: wazuh_log.stdout_lines
+      when:
+        - wazuh_log is defined
+        - wazuh_log.stdout_lines is defined

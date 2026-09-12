@@ -1,0 +1,23 @@
+# Fetch all hosts in eu-west-3 , the hostname is the public DNS if it exists, otherwise the private IP address
+plugin: amazon.aws.aws_ec2
+regions:
+  - eu-west-3 
+filters:
+  ## All instances with their `Environment` tag set to `dev`
+   tag:Environment: dev
+   instance-state-name: running
+strict_permissions: false
+compose:
+  # Use the private IP address to connect to the host
+  # (note: this does not modify inventory_hostname, which is set via I(hostnames))
+  ansible_host: private_ip_address
+  ansible_aws_ssm_instance_id: instance_id
+
+groups:
+  windows: "'DC' in ec2_tags.Name or 'Workstation' in ec2_tags.Name"
+  linux: "'Caldera' in ec2_tags.Name or 'Wazuh' in ec2_tags.Name"
+  Caldera: "'Caldera' in ec2_tags.Name"
+  Wazuh: "'Wazuh' in ec2_tags.Name"
+  Workstation: "'Workstation' in ec2_tags.Name"
+  DC: "'DC' in ec2_tags.Name"
+

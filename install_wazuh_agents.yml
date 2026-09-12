@@ -1,0 +1,101 @@
+---
+- name: Déploiement et configuration agent Wazuh sur Windows
+  hosts: windows
+  gather_facts: yes
+
+  vars:
+    wazuh_manager_ip: "{{ hostvars[groups['Wazuh'][0]]['ansible_host'] }}"
+    wazuh_version: "4.9.2"
+    wazuh_msi: "C:\\Users\\Public\\wazuh-agent.msi"
+    wazuh_config: "C:\\Program Files (x86)\\ossec-agent\\ossec.conf"
+
+  tasks:
+
+    - name: Afficher l'adresse dynamique du Manager
+      ansible.builtin.debug:
+        msg: "Wazuh Manager détecté : {{ wazuh_manager_ip }}"
+
+    - name: Télécharger l'agent Wazuh
+      ansible.windows.win_get_url:
+        url: "https://packages.wazuh.com/4.x/windows/wazuh-agent-{{ wazuh_version }}-1.msi"
+        dest: "{{ wazuh_msi }}"
+        timeout: 60
+
+    - name: Installer l'agent Wazuh
+      ansible.windows.win_package:
+        path: "{{ wazuh_msi }}"
+        state: present
+
+    - name: Configurer l'adresse du Wazuh Manager
+      ansible.windows.win_shell: |
+        $config = "{{ wazuh_config }}"
+
+        [xml]$xml = Get-Content $config
+
+        $server = $xml.ossec_config.client.server
+
+        if ($null -eq $server) {
+
+            $client = $xml.ossec_config.client
+
+            if ($null -eq $client) {
+                $client = $xml.CreateElement("client")
+                $xml.ossec_config.AppendChild($client) | Out-Null
+            }
+
+            $server = $xml.CreateElement("server")
+            $client.AppendChild($server) | Out-Null
+
+            $address = $xml.CreateElement("address")
+            $address.InnerText = "{{ wazuh_manager_ip }}"
+            $server.AppendChild($address) | Out-Null
+
+        } else {
+            $server.address = "{{ wazuh_manager_ip }}"
+        }
+
+        $xml.Save($config)
+
+    - name: Configurer la collecte des logs Windows
+      ansible.windows.win_shell: |
+        $config = "{{ wazuh_config }}"
+
+        [xml]$xml = Get-Content $config
+
+        $channels = @(
+            "Security",
+            "System",
+            "Application",
+            "Microsoft-Windows-PowerShell/Operational"
+        )
+
+        foreach ($channel in $channels) {
+
+            $exists = $xml.ossec_config.localfile | Where-Object {
+                $_.location -eq $channel
+            }
+
+            if (-not $exists) {
+
+                $localfile = $xml.CreateElement("localfile")
+
+                $location = $xml.CreateElement("location")
+                $location.InnerText = $channel
+
+                $log_format = $xml.CreateElement("log_format")
+                $log_format.InnerText = "eventchannel"
+
+                $localfile.AppendChild($location) | Out-Null
+                $localfile.AppendChild($log_format) | Out-Null
+
+                $xml.ossec_config.AppendChild($localfile) | Out-Null
+            }
+        }
+
+        $xml.Save($config)
+
+    - name: Redémarrer Wazuh Agent
+      ansible.windows.win_service:
+        name: WazuhSvc
+        state: restarted
+        start_mode: auto

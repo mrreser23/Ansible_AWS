@@ -1,0 +1,7 @@
+venv/
+*.deb
+*.retry
+.vault_pass
+*.pem
+*.log
+__pycache__/

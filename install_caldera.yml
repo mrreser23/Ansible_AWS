@@ -1,0 +1,149 @@
+---
+- name: Installation des prérequis Caldera
+  hosts: Caldera
+  become: true
+  tasks:
+    - name: Mettre à jour le cache apt
+      ansible.builtin.apt:
+        update_cache: true
+
+    - name: Ajouter la clé GPG du dépôt NodeSource
+      ansible.builtin.apt_key:
+        url: https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key
+        state: present
+
+    - name: Ajouter le dépôt NodeSource pour Node.js 22
+      ansible.builtin.apt_repository:
+        repo: "deb https://deb.nodesource.com/node_22.x nodistro main"
+        state: present
+        filename: nodesource
+
+    - name: Installer les paquets nécessaires
+      ansible.builtin.apt:
+        name:
+          - git
+          - python3.12-venv
+          - nodejs
+          - build-essential
+          - golang
+        state: present
+        update_cache: true
+
+    - name: Vérifier si le dépôt Caldera existe déjà
+      ansible.builtin.stat:
+        path: /opt/caldera/.git
+      register: caldera_repo
+
+    - name: Cloner le dépôt Caldera (avec sous-modules)
+      ansible.builtin.git:
+        repo: https://github.com/mitre/caldera.git
+        dest: /opt/caldera
+        version: master
+        recursive: true
+      when: not caldera_repo.stat.exists
+
+    - name: Vérifier si crypt_salt est encore la valeur par défaut
+      ansible.builtin.command: "grep -q 'crypt_salt: REPLACE_WITH_RANDOM_VALUE' /opt/caldera/conf/default.yml"
+      register: crypt_salt_check
+      changed_when: false
+      failed_when: false
+
+    - name: Vérifier si encryption_key est encore la valeur par défaut
+      ansible.builtin.command: "grep -q 'encryption_key: ADMIN123' /opt/caldera/conf/default.yml"
+      register: encryption_key_check
+      changed_when: false
+      failed_when: false
+
+    - name: Générer une valeur aléatoire pour crypt_salt
+      ansible.builtin.set_fact:
+        caldera_crypt_salt: "{{ lookup('ansible.builtin.password', '/dev/null', length=32, chars='hexdigits') | lower }}"
+      when: crypt_salt_check.rc == 0
+
+    - name: Générer une valeur aléatoire pour encryption_key
+      ansible.builtin.set_fact:
+        caldera_encryption_key: "{{ lookup('ansible.builtin.password', '/dev/null', length=32, chars='hexdigits') | lower }}"
+      when: encryption_key_check.rc == 0
+
+    - name: Remplacer crypt_salt par une valeur aléatoire
+      ansible.builtin.replace:
+        path: /opt/caldera/conf/default.yml
+        regexp: 'crypt_salt: REPLACE_WITH_RANDOM_VALUE'
+        replace: "crypt_salt: {{ caldera_crypt_salt }}"
+      when: crypt_salt_check.rc == 0
+
+    - name: Remplacer encryption_key par une valeur aléatoire
+      ansible.builtin.replace:
+        path: /opt/caldera/conf/default.yml
+        regexp: 'encryption_key: ADMIN123'
+        replace: "encryption_key: {{ caldera_encryption_key }}"
+      when: encryption_key_check.rc == 0
+
+    - name: Créer l'environnement virtuel Python
+      ansible.builtin.command:
+        cmd: python3.12 -m venv /opt/caldera/caldera-venv
+        creates: /opt/caldera/caldera-venv/bin/activate
+
+    - name: Installer les dépendances Python
+      ansible.builtin.pip:
+        requirements: /opt/caldera/requirements.txt
+        virtualenv: /opt/caldera/caldera-venv
+
+    - name: S'assurer que le service caldera n'est pas encore actif
+      ansible.builtin.systemd:
+        name: caldera
+        state: stopped
+      ignore_errors: true
+
+    - name: Nettoyer les résidus du build précédent (node_modules incompatibles)
+      ansible.builtin.file:
+        path: /opt/caldera/plugins/magma/node_modules
+        state: absent
+
+    - name: Compiler l'interface web Magma (une seule fois, idempotent)
+      ansible.builtin.command:
+        cmd: caldera-venv/bin/python3 server.py --insecure --build
+        chdir: /opt/caldera
+      async: 180
+      poll: 0
+      register: caldera_build
+      args:
+        creates: /opt/caldera/plugins/magma/dist/index.html
+
+    - name: Attendre que le build soit terminé
+      ansible.builtin.async_status:
+        jid: "{{ caldera_build.ansible_job_id }}"
+      register: build_result
+      until: build_result.finished
+      retries: 30
+      delay: 10
+      when: caldera_build.ansible_job_id is defined
+
+    - name: Créer le fichier de service systemd pour Caldera
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/caldera.service
+        content: |
+          [Unit]
+          Description=MITRE Caldera Server
+          After=network.target
+
+          [Service]
+          Type=simple
+          WorkingDirectory=/opt/caldera
+          ExecStart=/opt/caldera/caldera-venv/bin/python3 server.py --fresh
+          Restart=on-failure
+          RestartSec=5
+          User=root
+
+          [Install]
+          WantedBy=multi-user.target
+        mode: '0644'
+
+    - name: Recharger systemd pour prendre en compte le nouveau service
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Activer et démarrer le service Caldera
+      ansible.builtin.systemd:
+        name: caldera
+        enabled: true
+        state: started
